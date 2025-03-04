@@ -1,0 +1,429 @@
+import pandas as pd
+from sklearn.model_selection import train_test_split
+from xgboost import XGBRegressor
+from sklearn.multioutput import MultiOutputRegressor
+from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
+import numpy as np
+
+class XGB_fill_Forward():
+    def __init__(self):
+        """
+        初始化类
+        """
+        self.best_rf_models = {}  # 保存训练好的模型
+
+    def impute_test(self, all_data_csv):
+        """
+        主函数，接收数据文件地址并返回填补完毕的数据
+        :param all_data_csv: 数据文件路径
+        :return: 填补后的DataFrame
+        """
+        # 读取数据
+        self.all_data = pd.read_csv(all_data_csv, index_col=0)
+        self.filled_data = self.all_data.copy()
+
+        # 定义站点列
+        station_columns = [f'station_{i}' for i in range(1, 23)]  # station_1~station_23
+
+        for station_target in ['station_12']:
+            # 提取子数据集（仅包含当前station和其他特征）
+            
+            all_stations = [f'station_{i}' for i in range(1, 23)]
+            other_stations = [col for col in all_stations if col != station_target]
+            self.filled_data['station_avg'] = self.filled_data[other_stations].mean(axis=1, skipna=True)
+            self.filled_data['station_avg_pre'] = self.filled_data['station_avg'].shift(1)
+            
+            data_to_fill = self._extract_data_for_station(station_target)
+            
+            # 训练随机森林模型
+            best_rf_model = self._preprocess_and_train_rf_model(data_to_fill, station_target)
+
+            # 使用训练好的模型循环填补缺失值
+            filled_data_for_station = self._fill_missing_values(data_to_fill, best_rf_model, station_target)
+
+            # 更新全局数据
+            self.filled_data.loc[filled_data_for_station.index, station_target] = filled_data_for_station[station_target]
+
+        return self.filled_data
+
+    def _extract_data_for_station(self, station_target):
+        """
+        提取目标station及其相关特征
+        :param station: 当前处理的station列名（e.g., 'station_1'）
+        :return: 包含指定station及相关特征的DataFrame
+        """
+        # 选择需要的列：时间特征、气象特征和当前station
+
+        
+        columns_to_include = ['year', 'month', 'day', 'hour', 'is_weekday', 'season',
+                             'temperature', 'rel_hum', 'wind_speed', 'wind_dir',
+                             'pressure', 'precipitation', 'station_avg', 'station_avg_pre', station_target]
+        return self.filled_data[columns_to_include]
+
+    def _preprocess_and_train_rf_model(self, df, station_target):
+        """
+        预处理数据并训练随机森林回归模型
+        :param df: 当前处理的DataFrame
+        :param station: 当前处理的station列名
+        :return: 训练好的随机森林模型
+        """
+        # 添加station_pre列（上一行值）
+        df['station_pre'] = df[station_target].shift(1)
+
+        # 分离已知和未知数据
+        known_data = df[df[station_target].notnull()]
+        unknown_data = df[df[station_target].isnull()]
+
+        # 进一步分离出用于训练的数据
+        known_data_to_train = known_data[known_data['station_pre'].notnull()]
+        known_data_cannot_train = known_data[known_data['station_pre'].isnull()]
+
+        # 准备训练集
+        X = known_data_to_train.drop(columns=[station_target])
+        y = known_data_to_train[station_target]
+
+        # 划分训练集和测试集
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+        # 定义随机森林回归器和参数网格
+        rf = XGBRegressor(random_state=42)
+
+        rf.fit(X_train, y_train)
+
+        # 预测并评估模型
+        y_pred = rf.predict(X_test)
+        r2 = r2_score(y_test, y_pred)
+        rmse = np.sqrt(mean_squared_error(y_test, y_pred))
+        mae = mean_absolute_error(y_test, y_pred)
+        print(f"{station_target} Test set R^2: {r2}")
+        print(f"{station_target} Test set MSE: {rmse}")
+        print(f"{station_target} Test set MAE: {mae}")
+
+        return rf
+
+    def _fill_missing_values(self, df, best_rf_model, station):
+        """
+        循环填补缺失值
+        :param df: 当前处理的DataFrame
+        :param best_rf_model: 训练好的随机森林模型
+        :param station: 当前处理的station列名
+        :return: 填补后的DataFrame
+        """
+        df_filled = df.copy()
+
+        while True:
+            # 重新计算station_pre列（每次循环都要重新计算）
+            df_filled['station_pre'] = df_filled[station].shift(1)
+
+            # 分离已知和未知数据
+            known_data = df_filled[df_filled[station].notnull()]
+            unknown_data = df_filled[df_filled[station].isnull()]
+
+            # 分离出可以用来预测的数据
+            unknow_data_to_predict = unknown_data[unknown_data['station_pre'].notnull()]
+
+            # 如果没有可以预测的数据，结束循环
+            if unknow_data_to_predict.empty:
+                break
+
+            # 准备预测集
+            X_predict = unknow_data_to_predict.drop(columns=[station])
+
+            # 使用训练好的模型进行预测
+            predictions = best_rf_model.predict(X_predict)
+
+            # 将预测结果填充到原DataFrame中
+            for idx, pred in zip(unknow_data_to_predict.index, predictions):
+                df_filled.loc[idx, station] = pred
+
+        return df_filled
+
+
+class XGB_fill_Backward():
+    def __init__(self):
+        """
+        初始化类
+        """
+        self.best_rf_models = {}  # 保存训练好的模型
+
+    def impute_test(self, all_data_csv):
+        """
+        主函数，接收数据文件地址并返回填补完毕的数据
+        :param all_data_csv: 数据文件路径
+        :return: 填补后的DataFrame
+        """
+        
+        self.all_data = pd.read_csv(all_data_csv, parse_dates=True, index_col=0)
+        self.filled_data = self.all_data.copy()
+        
+        self.filled_data = self.filled_data[::-1].reset_index()
+        print(self.filled_data)
+        # 定义站点列
+        station_columns = [f'station_{i}' for i in range(1, 23)]  # station_1~station_23
+
+        for station_target in ['station_12']:
+            # 提取子数据集（仅包含当前station和其他特征）
+            
+            all_stations = [f'station_{i}' for i in range(1, 23)]
+            other_stations = [col for col in all_stations if col != station_target]
+            self.filled_data['station_avg'] = self.filled_data[other_stations].mean(axis=1, skipna=True)
+            self.filled_data['station_avg_pre'] = self.filled_data['station_avg'].shift(1)
+            
+            data_to_fill = self._extract_data_for_station(station_target)
+            
+            # 训练随机森林模型
+            best_rf_model = self._preprocess_and_train_rf_model(data_to_fill, station_target)
+
+            # 使用训练好的模型循环填补缺失值
+            filled_data_for_station = self._fill_missing_values(data_to_fill, best_rf_model, station_target)
+
+            # 更新全局数据
+            self.filled_data.loc[filled_data_for_station.index, station_target] = filled_data_for_station[station_target]
+        
+        self.filled_data = self.filled_data[::-1].reset_index().drop(['index'],axis=1)
+        self.filled_data.set_index("datetime", inplace=True)
+        
+        self.filled_data = self.filled_data.interpolate()
+
+        return self.filled_data
+
+    def _extract_data_for_station(self, station_target):
+        """
+        提取目标station及其相关特征
+        :param station: 当前处理的station列名（e.g., 'station_1'）
+        :return: 包含指定station及相关特征的DataFrame
+        """
+        # 选择需要的列：时间特征、气象特征和当前station
+
+        
+        columns_to_include = ['year', 'month', 'day', 'hour', 'is_weekday', 'season',
+                             'temperature', 'rel_hum', 'wind_speed', 'wind_dir',
+                             'pressure', 'precipitation', 'station_avg', 'station_avg_pre', station_target]
+        return self.filled_data[columns_to_include]
+
+    def _preprocess_and_train_rf_model(self, df, station_target):
+        """
+        预处理数据并训练随机森林回归模型
+        :param df: 当前处理的DataFrame
+        :param station: 当前处理的station列名
+        :return: 训练好的随机森林模型
+        """
+        # 添加station_pre列（上一行值）
+        df['station_pre'] = df[station_target].shift(1)
+
+        # 分离已知和未知数据
+        known_data = df[df[station_target].notnull()]
+        unknown_data = df[df[station_target].isnull()]
+
+        # 进一步分离出用于训练的数据
+        known_data_to_train = known_data[known_data['station_pre'].notnull()]
+        known_data_cannot_train = known_data[known_data['station_pre'].isnull()]
+
+        # 准备训练集
+        X = known_data_to_train.drop(columns=[station_target])
+        y = known_data_to_train[station_target]
+
+        # 划分训练集和测试集
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+        # 定义随机森林回归器和参数网格
+        rf = XGBRegressor(random_state=42)
+
+        rf.fit(X_train, y_train)
+
+        # 预测并评估模型
+        y_pred = rf.predict(X_test)
+        r2 = r2_score(y_test, y_pred)
+        rmse = np.sqrt(mean_squared_error(y_test, y_pred))
+        mae = mean_absolute_error(y_test, y_pred)
+        print(f"{station_target} Test set R^2: {r2}")
+        print(f"{station_target} Test set MSE: {rmse}")
+        print(f"{station_target} Test set MAE: {mae}")
+
+        return rf
+
+    def _fill_missing_values(self, df, best_rf_model, station):
+        """
+        循环填补缺失值
+        :param df: 当前处理的DataFrame
+        :param best_rf_model: 训练好的随机森林模型
+        :param station: 当前处理的station列名
+        :return: 填补后的DataFrame
+        """
+        df_filled = df.copy()
+
+        while True:
+            # 重新计算station_pre列（每次循环都要重新计算）
+            df_filled['station_pre'] = df_filled[station].shift(1)
+
+            # 分离已知和未知数据
+            known_data = df_filled[df_filled[station].notnull()]
+            unknown_data = df_filled[df_filled[station].isnull()]
+
+            # 分离出可以用来预测的数据
+            unknow_data_to_predict = unknown_data[unknown_data['station_pre'].notnull()]
+
+            # 如果没有可以预测的数据，结束循环
+            if unknow_data_to_predict.empty:
+                break
+
+            # 准备预测集
+            X_predict = unknow_data_to_predict.drop(columns=[station])
+
+            # 使用训练好的模型进行预测
+            predictions = best_rf_model.predict(X_predict)
+
+            # 将预测结果填充到原DataFrame中
+            for idx, pred in zip(unknow_data_to_predict.index, predictions):
+                df_filled.loc[idx, station] = pred
+
+        return df_filled
+    
+class Bi_XGBoost():
+    def __init__(self):
+
+        self.forward_model = XGB_fill_Forward()
+        self.backward_model = XGB_fill_Backward()
+    
+    def record_miss(self):
+        df = pd.read_csv(self.raw_data_file, index_col=0)
+        # 确保 index 是 datetime 类型
+        df.index = pd.to_datetime(df.index)
+        
+        # 定义需要处理的列
+        columns = [f'station_{i}' for i in range(1, 23)]
+    
+        # 遍历每一列
+        for column in columns:
+            # 使用自然数索引遍历
+            natural_index = np.arange(len(df))
+            # 获取缺失值的行
+            missing_rows = df[column].isnull()
+            
+            start_indices = []
+            end_indices = []
+            start_time_list = []
+            end_time_list = []
+            
+            current_start = None
+            current_end = None
+            
+            # 遍历自然数索引
+            for i, (idx, is_missing) in enumerate(zip(natural_index, missing_rows)):
+                if is_missing:
+                    # 缺失块开始或扩展
+                    if current_start is None:
+                        current_start = i
+                        current_end = i
+                    else:
+                        current_end = i
+                else:
+                    # 缺失块结束
+                    if current_start is not None:
+                        # 保存区间
+                        start_indices.append(current_start)
+                        end_indices.append(current_end)
+                        # 保存时间戳
+                        start_time = df.index[current_start].strftime("%Y/%m/%d %H:%M")
+                        end_time = df.index[current_end].strftime("%Y/%m/%d %H:%M")
+                        start_time_list.append(start_time)
+                        end_time_list.append(end_time)
+                        # 重置
+                        current_start = None
+                        current_end = None
+            
+            # 检查最后是否有未结束的缺失块
+            if current_start is not None:
+                start_indices.append(current_start)
+                end_indices.append(current_end)
+                # 保存时间戳
+                start_time = df.index[current_start].strftime("%Y/%m/%d %H:%M")
+                end_time = df.index[current_end].strftime("%Y/%m/%d %H:%M")
+                start_time_list.append(start_time)
+                end_time_list.append(end_time)
+            
+            # 创建结果 DataFrame
+            result = pd.DataFrame({
+                'start_time': start_time_list,
+                'end_time': end_time_list
+            })
+    
+            # 保存结果到文件
+            file_name = f"time_rec/miss_{column}_interval.csv"
+            result.to_csv(file_name, index=False)
+            print(f"Missing intervals for {column} saved to {file_name}")
+        
+    def impute_test(self, raw_data_file):
+        self.raw_data_file = raw_data_file
+        
+        self.record_miss()
+
+        # 加载数据集 A 和 B
+        A = self.forward_model.impute_test(self.raw_data_file)
+        A.index = pd.to_datetime(A.index)
+        B = self.backward_model.impute_test(self.raw_data_file)
+        B.index = pd.to_datetime(B.index)
+
+        # 复制数据集 A 作为基础
+        C = A.copy()
+    
+        # 处理每一列
+        for col in A.columns:
+            # 加载缺失数据位置文件
+            missing_file = f"time_rec/miss_{col}_interval.csv"
+            try:
+                missing_df = pd.read_csv(missing_file)
+            except FileNotFoundError:
+                print(f"警告：未找到缺失数据文件 {missing_file}，跳过列 {col}")
+                continue
+            
+            # 遍历该列的每一行缺失区间
+            for _, row in missing_df.iterrows():
+                start_time = pd.to_datetime(row['start_time'])
+                end_time = pd.to_datetime(row['end_time'])
+                
+                # 在 A 和 B 中找到对应的行
+                A_interval = A.loc[start_time:end_time, col]
+                B_interval = B.loc[start_time:end_time, col]
+                
+                # 计算权重
+                n = len(A_interval)
+                if n == 0:
+                    continue  # 跳过空区间
+                
+                #===========sin权重=============#
+                # 权重从 1 到 0（A 的权重）
+                # x = np.linspace(np.pi/2, 0, n)
+                # weights_a = np.sin(x)
+                # # 权重从 0 到 1（B 的权重）
+                # y = np.linspace(0, np.pi/2, n)
+                # weights_b = np.sin(y)
+                
+                #===========线性权重=============#
+                # 权重从 1 到 0（A 的权重）
+                weights_a = np.linspace(1, 0, n)
+                # 权重从 0 到 1（B 的权重）
+                weights_b = np.linspace(0, 1, n)
+                
+                # 计算加权平均值
+                # 修复 nan 值
+                A_values = A_interval.fillna(0).values
+                B_values = B_interval.fillna(0).values
+                
+                weighted_avg = (A_values * weights_a) + (B_values * weights_b)
+                
+                # 更新数据集 C
+                C.loc[start_time:end_time, col] = weighted_avg
+        
+        return C
+
+
+if __name__ == '__main__':
+    # test_file = "../data_pool/generate_data/temporal_temporal_3.csv"
+    test_file = "../data_pool/generate_data/temporal_temporal_2.csv"
+    imputer = XGB_fill_Backward()
+    imputed_data = imputer.impute_test(test_file)
+    imputed_data.to_csv("filled.csv", index=True)
+    # bi_xgb_filler = Bi_XGBoost()
+    # final = bi_xgb_filler.impute_test(test_file)
+    # final.to_csv("filled.csv", index=True)
